@@ -299,6 +299,12 @@ wss.on("connection", (ws, req) => {
         });
         break;
       }
+
+      // ── ping keepalive ────────────────────────────────────────
+      case "ping": {
+        safeSend(ws, { type: "pong" });
+        break;
+      }
     }
   });
 
