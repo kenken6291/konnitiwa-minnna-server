@@ -180,10 +180,9 @@ wss.on("connection", (ws, req) => {
         const nx = safeInt(msg.x, 0, WORLD_W);
         const ny = safeInt(msg.y, 0, WORLD_H);
         if (nx === null || ny === null) return;
-        const dx = clamp(nx - p.x, -MAX_SPEED, MAX_SPEED);
-        const dy = clamp(ny - p.y, -MAX_SPEED, MAX_SPEED);
-        p.x = clamp(p.x + dx, 0, WORLD_W);
-        p.y = clamp(p.y + dy, 0, WORLD_H);
+        // 速度制限を廃止：座標をそのまま反映（境界clampのみ）
+        p.x = nx;
+        p.y = ny;
         const nc = cellOf(p.x, p.y);
         if (nc.col !== p.col || nc.row !== p.row) {
           removeCell(id, p.col, p.row);
