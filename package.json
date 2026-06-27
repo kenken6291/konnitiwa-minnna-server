@@ -1,0 +1,16 @@
+{
+  "name": "konnitiwa-minnna-server",
+  "version": "1.0.0",
+  "description": "こんにちは、みんな — 1000人対応バーチャル街 WebSocket サーバー",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev":   "node --watch server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
