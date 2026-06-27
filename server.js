@@ -334,6 +334,7 @@ setInterval(() => {
     const peerIds  = aoiPeers(p.col, p.row);
     const snapshot = [];
     peerIds.forEach(pid => {
+      if (pid === p.id) return;   // 自分自身は除外
       const q = players.get(pid);
       if (!q) return;
       snapshot.push({
