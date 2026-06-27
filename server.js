@@ -1,16 +1,11 @@
 /**
- * こんにちは、みんな — server.js  (セキュリティ強化版)
- * =====================================================
- * セキュリティ対策一覧
- *   [S1] メッセージサイズ上限 (MAX_MSG_BYTES) → 巨大JSON拒否
- *   [S2] IP単位の接続数上限 (MAX_CONN_PER_IP) → DoS対策
- *   [S3] チャットレート制限 (CHAT_RATE_*) → スパム対策
- *   [S4] Heartbeat / ping-pong → ゾンビ接続の自動切断
- *   [S5] 入力サニタイズ → 制御文字・HTML除去
- *   [S6] 数値の厳密検証 → NaN/Infinity拒否
- *   [S7] avatar ホワイトリスト → 想定外絵文字排除
- *   [S8] profile 更新レート制限 → 連打対策
- *   [S9] エラー時も安全にクリーンアップ
+ * こんにちは、みんな — server.js (WebRTC シグナリング対応版)
+ * ============================================================
+ * 追加機能
+ *   [P] 8桁パスコード管理（初回発行・再入室）
+ *   [R] WebRTC シグナリング（offer / answer / ice）
+ *
+ * セキュリティ対策は全て維持
  */
 
 const { WebSocketServer } = require("ws");
@@ -23,62 +18,44 @@ const WORLD_W          = 10000;
 const WORLD_H          = 8000;
 const CELL             = 800;
 const AOI_RADIUS       = 2;
-const TICK_MS          = 50;          // 20fps tick
-const MAX_SPEED        = 10;          // px / tick
-
-// [S1] メッセージサイズ上限
-const MAX_MSG_BYTES    = 512;         // バイト
-
-// [S2] IP単位の接続数上限
+const TICK_MS          = 50;
+const MAX_SPEED        = 10;
+const MAX_MSG_BYTES    = 4096;   // WebRTC SDPが大きいため拡張
 const MAX_CONN_PER_IP  = 5;
-
-// [S3] チャットレート制限
-const CHAT_RATE_LIMIT  = 5;          // CHAT_RATE_WINDOW ms 内の最大発言数
-const CHAT_RATE_WINDOW = 5000;       // ms
-
-// [S4] Heartbeat
-const PING_INTERVAL    = 30_000;     // ms
-const PING_TIMEOUT     = 10_000;     // ms（pongが来なければ切断）
-
-// [S8] profile更新レート制限
-const PROFILE_COOLDOWN = 3000;       // ms
-
-// チャット
+const CHAT_RATE_LIMIT  = 5;
+const CHAT_RATE_WINDOW = 5000;
+const PING_INTERVAL    = 30_000;
+const PROFILE_COOLDOWN = 3000;
 const MAX_CHAT_LEN     = 60;
 const MAX_NICK_LEN     = 16;
-const MAX_TITLE_LEN    = 20;
-const MAX_HOBBY_LEN    = 10;
-const MAX_HOBBIES      = 3;
+const CALL_RANGE       = 500;    // 通話開始距離 px
 
 const COLS = Math.ceil(WORLD_W / CELL);
 const ROWS = Math.ceil(WORLD_H / CELL);
 
-// [S7] 許可アバター絵文字ホワイトリスト
 const ALLOWED_AVATARS = new Set([
   "👴","👵","🧑","👩","👨","🧓","🐱","🐶","🦊","🐼",
 ]);
-
-// [S5] 許可ホビーホワイトリスト（GASと同期させること）
-const ALLOWED_HOBBIES = new Set([
-  "旅行","料理","読書","音楽","映画","園芸","写真",
-  "手芸","釣り","将棋","囲碁","お茶","俳句","書道",
-  "散歩","ヨガ","登山","温泉","野球","相撲観戦",
-]);
-
-// [S5] 許可称号ホワイトリスト（GASと同期させること）
 const ALLOWED_TITLES = new Set([
   "🌸 花見名人","🍵 お茶好き","🎵 音楽好き","📚 読書家",
   "🌿 園芸家","🎨 絵かき","🚶 散歩好き","🍳 料理上手",
   "🐾 動物好き","✈️ 旅好き","♟ 将棋愛好家","🎣 釣り人",
   "🏮 お祭り好き","🌙 夜型人間","☀️ 朝型人間","",
 ]);
+const ALLOWED_HOBBIES = new Set([
+  "旅行","料理","読書","音楽","映画","園芸","写真",
+  "手芸","釣り","将棋","囲碁","お茶","俳句","書道",
+  "散歩","ヨガ","登山","温泉","野球","相撲観戦",
+]);
 
 // ══════════════════════════════════════════════════════════════════
 //  状態
 // ══════════════════════════════════════════════════════════════════
-const players   = new Map();  // id → PlayerState
-const ipCount   = new Map();  // ip → 接続数
-let   nextId    = 1;
+const players  = new Map();   // id → PlayerState
+const ipCount  = new Map();   // ip → 接続数
+// [P] パスコード管理: passcode(8桁文字列) → {nick, avatar, title, hobbies}
+const passcodeStore = new Map();
+let   nextId   = 1;
 
 const cells = Array.from({ length: ROWS }, () =>
   Array.from({ length: COLS }, () => new Set())
@@ -89,21 +66,16 @@ const cells = Array.from({ length: ROWS }, () =>
 // ══════════════════════════════════════════════════════════════════
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 
-/** 制御文字・HTMLタグを除去してトリムする */
 function sanitize(str, maxLen) {
   return String(str)
-    .replace(/[\u0000-\u001F\u007F<>&"'`]/g, "")  // 制御文字・HTML特殊文字
-    .trim()
-    .slice(0, maxLen);
+    .replace(/[\u0000-\u001F\u007F<>&"'`]/g, "")
+    .trim().slice(0, maxLen);
 }
-
-/** 安全な整数か（NaN/Infinity/非数値を拒否） */
 function safeInt(v, lo, hi) {
   const n = Number(v);
   if (!Number.isFinite(n)) return null;
   return clamp(Math.floor(n), lo, hi);
 }
-
 function cellOf(x, y) {
   return {
     col: clamp(Math.floor(x / CELL), 0, COLS - 1),
@@ -116,7 +88,6 @@ function addCell(id, x, y) {
   return c;
 }
 function removeCell(id, col, row) { cells[row][col].delete(id); }
-
 function aoiPeers(col, row) {
   const ids = new Set();
   for (let r = row - AOI_RADIUS; r <= row + AOI_RADIUS; r++) {
@@ -128,33 +99,39 @@ function aoiPeers(col, row) {
   }
   return ids;
 }
-
 function safeSend(ws, obj) {
   if (ws.readyState === 1) {
-    try { ws.send(JSON.stringify(obj)); } catch { /* 送信失敗は無視 */ }
+    try { ws.send(JSON.stringify(obj)); } catch {}
   }
 }
-
-/** IP文字列の取得（プロキシ環境にも対応） */
 function getIP(req) {
-  const forwarded = req.headers["x-forwarded-for"];
-  if (forwarded) return forwarded.split(",")[0].trim();
+  const f = req.headers["x-forwarded-for"];
+  if (f) return f.split(",")[0].trim();
   return req.socket.remoteAddress || "unknown";
+}
+
+// [P] 8桁パスコード生成（重複チェック付き）
+function genPasscode() {
+  let code;
+  do {
+    code = String(Math.floor(Math.random() * 100000000)).padStart(8, "0");
+  } while (passcodeStore.has(code));
+  return code;
 }
 
 // ══════════════════════════════════════════════════════════════════
 //  WebSocket サーバー
 // ══════════════════════════════════════════════════════════════════
 const wss = new WebSocketServer({ port: PORT });
-console.log(`[server] ws://localhost:${PORT}  world=${WORLD_W}×${WORLD_H}`);
+console.log(`[server] ws://localhost:${PORT}`);
 
 wss.on("connection", (ws, req) => {
   const ip = getIP(req);
 
-  // [S2] IP単位の接続数チェック
+  // IP制限
   const connCount = ipCount.get(ip) || 0;
   if (connCount >= MAX_CONN_PER_IP) {
-    ws.close(1008, "Too many connections from this IP");
+    ws.close(1008, "Too many connections");
     return;
   }
   ipCount.set(ip, connCount + 1);
@@ -166,16 +143,12 @@ wss.on("connection", (ws, req) => {
   const p = {
     id, ws, ip,
     x: spX, y: spY,
-    nick:   `みんな${id}`,
-    avatar: "👴",
-    title:  "",
-    hobbies: [],
+    nick: `みんな${id}`, avatar: "👴",
+    title: "", hobbies: [],
+    passcode: null,         // [P]
     col: 0, row: 0,
-    // [S3] チャットレート制限
     chatTimes: [],
-    // [S8] profile更新クールダウン
     lastProfileAt: 0,
-    // [S4] Heartbeat
     isAlive: true,
   };
   const { col, row } = addCell(id, spX, spY);
@@ -189,40 +162,28 @@ wss.on("connection", (ws, req) => {
     worldW: WORLD_W, worldH: WORLD_H,
   });
 
-  // [S4] pong 受信でアライブフラグを立て直す
   ws.on("pong", () => { p.isAlive = true; });
 
   // ── メッセージ受信 ─────────────────────────────────────────────
   ws.on("message", (rawBuf, isBinary) => {
-    // [S1] バイナリ拒否 & サイズ上限
     if (isBinary) return;
-    if (rawBuf.length > MAX_MSG_BYTES) {
-      ws.close(1009, "Message too large");
-      return;
-    }
+    if (rawBuf.length > MAX_MSG_BYTES) { ws.close(1009, "Too large"); return; }
 
     let msg;
-    try { msg = JSON.parse(rawBuf.toString("utf8")); }
-    catch { return; }  // 不正JSONは無視
-
-    // typeは文字列のみ
+    try { msg = JSON.parse(rawBuf.toString("utf8")); } catch { return; }
     if (typeof msg.type !== "string") return;
 
     switch (msg.type) {
 
       // ── 移動 ──────────────────────────────────────────────────
       case "move": {
-        // [S6] 数値の厳密検証
         const nx = safeInt(msg.x, 0, WORLD_W);
         const ny = safeInt(msg.y, 0, WORLD_H);
         if (nx === null || ny === null) return;
-
-        // [S1 extension] 速度チェック
         const dx = clamp(nx - p.x, -MAX_SPEED, MAX_SPEED);
         const dy = clamp(ny - p.y, -MAX_SPEED, MAX_SPEED);
         p.x = clamp(p.x + dx, 0, WORLD_W);
         p.y = clamp(p.y + dy, 0, WORLD_H);
-
         const nc = cellOf(p.x, p.y);
         if (nc.col !== p.col || nc.row !== p.row) {
           removeCell(id, p.col, p.row);
@@ -232,101 +193,136 @@ wss.on("connection", (ws, req) => {
         break;
       }
 
-      // ── プロフィール設定 ───────────────────────────────────────
+      // ── プロフィール ───────────────────────────────────────────
       case "profile": {
-        // [S8] 連打対策
         const now = Date.now();
         if (now - p.lastProfileAt < PROFILE_COOLDOWN) return;
         p.lastProfileAt = now;
-
-        // [S5] nick：制御文字除去・長さ制限
         if (typeof msg.nick === "string") {
-          const clean = sanitize(msg.nick, MAX_NICK_LEN);
-          if (clean) p.nick = clean;
+          const c = sanitize(msg.nick, MAX_NICK_LEN); if (c) p.nick = c;
         }
-
-        // [S7] avatar：ホワイトリスト
-        if (typeof msg.avatar === "string") {
-          if (ALLOWED_AVATARS.has(msg.avatar)) p.avatar = msg.avatar;
-        }
-
-        // [S5][S7] title：ホワイトリスト
-        if (typeof msg.title === "string") {
-          if (ALLOWED_TITLES.has(msg.title)) p.title = msg.title;
-        }
-
-        // [S5][S7] hobbies：ホワイトリスト & 件数制限
+        if (ALLOWED_AVATARS.has(msg.avatar)) p.avatar = msg.avatar;
+        if (ALLOWED_TITLES.has(msg.title))   p.title  = msg.title;
         if (Array.isArray(msg.hobbies)) {
           p.hobbies = msg.hobbies
-            .filter(h => typeof h === "string" && ALLOWED_HOBBIES.has(h))
-            .slice(0, MAX_HOBBIES);
+            .filter(h => ALLOWED_HOBBIES.has(h)).slice(0, 3);
+        }
+        // パスコードのプロフィールも更新
+        if (p.passcode && passcodeStore.has(p.passcode)) {
+          passcodeStore.set(p.passcode, {
+            nick: p.nick, avatar: p.avatar,
+            title: p.title, hobbies: p.hobbies,
+          });
         }
         break;
       }
 
       // ── チャット ───────────────────────────────────────────────
       case "chat": {
-        // [S3] レート制限
         const now = Date.now();
         p.chatTimes = p.chatTimes.filter(t => now - t < CHAT_RATE_WINDOW);
-        if (p.chatTimes.length >= CHAT_RATE_LIMIT) return;  // 無視（切断しない）
+        if (p.chatTimes.length >= CHAT_RATE_LIMIT) return;
         p.chatTimes.push(now);
-
-        // [S5] テキストサニタイズ
         const text = sanitize(String(msg.text || ""), MAX_CHAT_LEN);
         if (!text) return;
-
-        // AOI内 & 距離内のピアにのみ配信
-        const peers = aoiPeers(p.col, p.row);
-        peers.forEach(pid => {
+        aoiPeers(p.col, p.row).forEach(pid => {
           const peer = players.get(pid);
           if (!peer) return;
           if (Math.hypot(peer.x - p.x, peer.y - p.y) > 400) return;
           safeSend(peer.ws, {
             type: "chat", from: id,
-            nick: p.nick, avatar: p.avatar,
-            text,           // サニタイズ済み
+            nick: p.nick, avatar: p.avatar, text,
             x: p.x, y: p.y,
           });
         });
         break;
       }
 
-      // 未知のtypeは完全無視（エラー応答も返さない）
+      // ── [P] パスコード発行 ─────────────────────────────────────
+      case "issue_passcode": {
+        if (p.passcode) {
+          // すでに発行済み → 再通知
+          safeSend(ws, { type: "passcode", code: p.passcode });
+          return;
+        }
+        const code = genPasscode();
+        p.passcode = code;
+        passcodeStore.set(code, {
+          nick: p.nick, avatar: p.avatar,
+          title: p.title, hobbies: p.hobbies,
+        });
+        safeSend(ws, { type: "passcode", code });
+        break;
+      }
+
+      // ── [P] パスコードで再入室 ─────────────────────────────────
+      case "restore_passcode": {
+        const code = sanitize(String(msg.code || ""), 8);
+        if (!/^\d{8}$/.test(code)) {
+          safeSend(ws, { type: "passcode_result", ok: false, reason: "形式エラー" });
+          return;
+        }
+        const saved = passcodeStore.get(code);
+        if (!saved) {
+          safeSend(ws, { type: "passcode_result", ok: false, reason: "見つかりません" });
+          return;
+        }
+        // プロフィールを復元
+        p.nick    = saved.nick;
+        p.avatar  = saved.avatar;
+        p.title   = saved.title;
+        p.hobbies = saved.hobbies;
+        p.passcode = code;
+        safeSend(ws, {
+          type: "passcode_result", ok: true,
+          nick: p.nick, avatar: p.avatar,
+          title: p.title, hobbies: p.hobbies,
+        });
+        break;
+      }
+
+      // ── [R] WebRTC シグナリング中継 ───────────────────────────
+      // offer / answer / ice をターゲットIDに中継する
+      case "rtc_offer":
+      case "rtc_answer":
+      case "rtc_ice": {
+        const target = players.get(String(msg.to || ""));
+        if (!target) return;
+        // 距離チェック（CALL_RANGE×2以内の相手にのみ中継）
+        if (Math.hypot(target.x - p.x, target.y - p.y) > CALL_RANGE * 2) return;
+        safeSend(target.ws, {
+          type: msg.type,
+          from: id,
+          // SDPとICE候補をそのまま通す（内容は検証しない・暗号化はWSSで担保）
+          sdp:       msg.sdp,
+          candidate: msg.candidate,
+        });
+        break;
+      }
     }
   });
 
-  // ── 切断・エラー ───────────────────────────────────────────────
   function cleanup() {
-    if (!players.has(id)) return;  // 二重呼び出し防止
+    if (!players.has(id)) return;
     removeCell(id, p.col, p.row);
     players.delete(id);
     const c = (ipCount.get(ip) || 1) - 1;
     if (c <= 0) ipCount.delete(ip); else ipCount.set(ip, c);
   }
-
   ws.on("close", cleanup);
   ws.on("error", () => { try { ws.terminate(); } catch {} cleanup(); });
 });
 
-// ══════════════════════════════════════════════════════════════════
-//  [S4] Heartbeat — ゾンビ接続の定期切断
-// ══════════════════════════════════════════════════════════════════
+// ── Heartbeat ─────────────────────────────────────────────────────
 setInterval(() => {
-  players.forEach((p, id) => {
-    if (!p.isAlive) {
-      // pong未返答 → 強制切断
-      try { p.ws.terminate(); } catch {}
-      return;
-    }
+  players.forEach(p => {
+    if (!p.isAlive) { try { p.ws.terminate(); } catch {} return; }
     p.isAlive = false;
     try { p.ws.ping(); } catch {}
   });
 }, PING_INTERVAL);
 
-// ══════════════════════════════════════════════════════════════════
-//  AOI スナップショット tick
-// ══════════════════════════════════════════════════════════════════
+// ── AOI スナップショット tick ──────────────────────────────────────
 setInterval(() => {
   players.forEach(p => {
     if (p.ws.readyState !== 1) return;
@@ -345,9 +341,6 @@ setInterval(() => {
   });
 }, TICK_MS);
 
-// ══════════════════════════════════════════════════════════════════
-//  死活ログ
-// ══════════════════════════════════════════════════════════════════
 setInterval(() => {
-  console.log(`[health] online=${players.size}  unique_ips=${ipCount.size}`);
+  console.log(`[health] online=${players.size} passcodes=${passcodeStore.size}`);
 }, 15_000);
