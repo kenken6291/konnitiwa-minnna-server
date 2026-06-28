@@ -33,17 +33,17 @@ const SHARD_ID           = Number(process.env.SHARD_ID || 0);
 const MAX_PLAYERS        = Number(process.env.MAX_PLAYERS || 10000); // 1シャード最大
 
 // ワールドサイズ（1000倍面積 = 辺√1000≒31.6倍）
-const WORLD_W            = 3_162_000;   // px
-const WORLD_H            = 3_162_000;   // px
+const WORLD_W            = 10_000;   // px
+const WORLD_H            = 8_000;   // px
 
 // AOI
-const CELL               = 8_000;       // セルサイズ px
-const AOI_RADIUS         = 1;           // 自セル±1 → 3×3=9セル
-const TICK_MS            = 100;         // 10fps（CPU節約）
+const CELL               = 800;   // セルサイズ px
+const AOI_RADIUS         = 2;   // 自セル±2 → 5×5=25セル
+const TICK_MS            = 50;   // 20fps
 
 // セキュリティ
 const MAX_MSG_BYTES      = 1024;
-const MAX_CONN_PER_IP    = 3;
+const MAX_CONN_PER_IP    = 5;
 const CHAT_RATE_LIMIT    = 5;
 const CHAT_RATE_WINDOW   = 5000;
 const PING_INTERVAL      = 30_000;
@@ -53,8 +53,8 @@ const PROFILE_COOLDOWN   = 3000;
 const MAX_CHAT_LEN       = 60;
 const MAX_NICK_LEN       = 16;
 
-const COLS = Math.ceil(WORLD_W / CELL);   // 396
-const ROWS = Math.ceil(WORLD_H / CELL);   // 396
+const COLS = Math.ceil(WORLD_W / CELL);   // 13
+const ROWS = Math.ceil(WORLD_H / CELL);   // 10
 
 // ホワイトリスト
 const ALLOWED_AVATARS = new Set([
