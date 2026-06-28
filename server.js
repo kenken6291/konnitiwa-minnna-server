@@ -326,6 +326,20 @@ wss.on("connection", (ws, req) => {
         break;
       }
 
+      // ── GASログ転送（フロントはGAS URLを知らない）────────────
+      case "gas_log": {
+        const gasUrl = process.env.GAS_URL;
+        if (!gasUrl || typeof msg.payload !== "object") return;
+        const pl = { ...msg.payload };
+        if (typeof pl.action !== "string") return;
+        fetch(gasUrl, {
+          method: "POST",
+          headers: { "Content-Type": "text/plain" },
+          body: JSON.stringify(pl),
+        }).catch(() => {});
+        break;
+      }
+
       case "ping": safeSend(ws, { type: "pong" }); break;
     }
   });
