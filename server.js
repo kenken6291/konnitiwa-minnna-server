@@ -1,11 +1,26 @@
 /**
- * こんにちは、みんな — server.js (WebRTC シグナリング対応版)
+ * こんにちは、みんな — server.js (100万人対応・シャード設計版)
  * ============================================================
- * 追加機能
- *   [P] 8桁パスコード管理（初回発行・再入室）
- *   [R] WebRTC シグナリング（offer / answer / ice）
  *
- * セキュリティ対策は全て維持
+ * ── スケール設計 ──────────────────────────────────────────────────
+ *  ワールド : 3,162,000 × 3,162,000 px（1000倍面積）
+ *  AOIセル  : 8,000 px → 396×396 = 156,816 セル
+ *  AOI範囲  : 自セル±1 → 3×3 = 9セル（通信量最小化）
+ *  1シャード: 最大 MAX_PLAYERS_PER_SHARD 人
+ *  シャードID: 環境変数 SHARD_ID（0,1,2...）で識別
+ *
+ * ── 水平スケール方法 ─────────────────────────────────────────────
+ *  1台 : ～10,000人
+ *  10台 : ～100,000人
+ *  100台: ～1,000,000人
+ *  → Railway/Fly.io で SHARD_ID を変えてデプロイを増やすだけ
+ *    フロントは SHARD_ID = Math.floor(Math.random()*SHARD_COUNT)
+ *    で接続先を振り分ける
+ *
+ * ── AOI 通信量 ────────────────────────────────────────────────────
+ *  1セルあたり平均人数 = 10,000 ÷ 156,816 ≒ 0.06人
+ *  9セル範囲の平均人数 = 約0.54人
+ *  → 超疎ら。密集エリアでは最大 MAX_PLAYERS_PER_SHARD 人規模でも安全
  */
 
 const { WebSocketServer } = require("ws");
@@ -13,26 +28,35 @@ const { WebSocketServer } = require("ws");
 // ══════════════════════════════════════════════════════════════════
 //  定数
 // ══════════════════════════════════════════════════════════════════
-const PORT             = process.env.PORT || 8080;
-const WORLD_W          = 10000;
-const WORLD_H          = 8000;
-const CELL             = 800;
-const AOI_RADIUS       = 2;
-const TICK_MS          = 50;
-const MAX_SPEED        = 10;
-const MAX_MSG_BYTES    = 4096;   // WebRTC SDPが大きいため拡張
-const MAX_CONN_PER_IP  = 5;
-const CHAT_RATE_LIMIT  = 5;
-const CHAT_RATE_WINDOW = 5000;
-const PING_INTERVAL    = 30_000;
-const PROFILE_COOLDOWN = 3000;
-const MAX_CHAT_LEN     = 60;
-const MAX_NICK_LEN     = 16;
-const CALL_RANGE       = 500;    // 通話開始距離 px
+const PORT               = process.env.PORT            || 8080;
+const SHARD_ID           = Number(process.env.SHARD_ID || 0);
+const MAX_PLAYERS        = Number(process.env.MAX_PLAYERS || 10000); // 1シャード最大
 
-const COLS = Math.ceil(WORLD_W / CELL);
-const ROWS = Math.ceil(WORLD_H / CELL);
+// ワールドサイズ（1000倍面積 = 辺√1000≒31.6倍）
+const WORLD_W            = 3_162_000;   // px
+const WORLD_H            = 3_162_000;   // px
 
+// AOI
+const CELL               = 8_000;       // セルサイズ px
+const AOI_RADIUS         = 1;           // 自セル±1 → 3×3=9セル
+const TICK_MS            = 100;         // 10fps（CPU節約）
+
+// セキュリティ
+const MAX_MSG_BYTES      = 1024;
+const MAX_CONN_PER_IP    = 3;
+const CHAT_RATE_LIMIT    = 5;
+const CHAT_RATE_WINDOW   = 5000;
+const PING_INTERVAL      = 30_000;
+const PROFILE_COOLDOWN   = 3000;
+
+// 文字数制限
+const MAX_CHAT_LEN       = 60;
+const MAX_NICK_LEN       = 16;
+
+const COLS = Math.ceil(WORLD_W / CELL);   // 396
+const ROWS = Math.ceil(WORLD_H / CELL);   // 396
+
+// ホワイトリスト
 const ALLOWED_AVATARS = new Set([
   "👴","👵","🧑","👩","👨","🧓","🐱","🐶","🦊","🐼",
 ]);
@@ -51,15 +75,14 @@ const ALLOWED_HOBBIES = new Set([
 // ══════════════════════════════════════════════════════════════════
 //  状態
 // ══════════════════════════════════════════════════════════════════
-const players  = new Map();   // id → PlayerState
-const ipCount  = new Map();   // ip → 接続数
-// [P] パスコード管理: passcode(8桁文字列) → {nick, avatar, title, hobbies}
-const passcodeStore = new Map();
-let   nextId   = 1;
+const players      = new Map();
+const ipCount      = new Map();
+const passcodeStore= new Map();
+let   nextId       = 1;
 
-const cells = Array.from({ length: ROWS }, () =>
-  Array.from({ length: COLS }, () => new Set())
-);
+// AOIグリッド（疎らなので実体セルのみMapで保持→メモリ節約）
+// cells[row][col] = Set<id>  ただし空セルは作らない
+const cells = new Map();  // key = `${row},${col}` → Set<id>
 
 // ══════════════════════════════════════════════════════════════════
 //  ユーティリティ
@@ -76,29 +99,44 @@ function safeInt(v, lo, hi) {
   if (!Number.isFinite(n)) return null;
   return clamp(Math.floor(n), lo, hi);
 }
+
 function cellOf(x, y) {
   return {
     col: clamp(Math.floor(x / CELL), 0, COLS - 1),
     row: clamp(Math.floor(y / CELL), 0, ROWS - 1),
   };
 }
+
+function cellKey(col, row) { return `${row},${col}`; }
+
 function addCell(id, x, y) {
   const c = cellOf(x, y);
-  cells[c.row][c.col].add(id);
+  const k = cellKey(c.col, c.row);
+  if (!cells.has(k)) cells.set(k, new Set());
+  cells.get(k).add(id);
   return c;
 }
-function removeCell(id, col, row) { cells[row][col].delete(id); }
+function removeCell(id, col, row) {
+  const k = cellKey(col, row);
+  const s = cells.get(k);
+  if (!s) return;
+  s.delete(id);
+  if (s.size === 0) cells.delete(k); // 空セルは削除（メモリ節約）
+}
+
 function aoiPeers(col, row) {
   const ids = new Set();
   for (let r = row - AOI_RADIUS; r <= row + AOI_RADIUS; r++) {
     if (r < 0 || r >= ROWS) continue;
     for (let c = col - AOI_RADIUS; c <= col + AOI_RADIUS; c++) {
       if (c < 0 || c >= COLS) continue;
-      cells[r][c].forEach(id => ids.add(id));
+      const s = cells.get(cellKey(c, r));
+      if (s) s.forEach(id => ids.add(id));
     }
   }
   return ids;
 }
+
 function safeSend(ws, obj) {
   if (ws.readyState === 1) {
     try { ws.send(JSON.stringify(obj)); } catch {}
@@ -109,8 +147,6 @@ function getIP(req) {
   if (f) return f.split(",")[0].trim();
   return req.socket.remoteAddress || "unknown";
 }
-
-// [P] 8桁パスコード生成（重複チェック付き）
 function genPasscode() {
   let code;
   do {
@@ -123,10 +159,16 @@ function genPasscode() {
 //  WebSocket サーバー
 // ══════════════════════════════════════════════════════════════════
 const wss = new WebSocketServer({ port: PORT });
-console.log(`[server] ws://localhost:${PORT}`);
+console.log(`[shard:${SHARD_ID}] ws://localhost:${PORT}  world=${WORLD_W}×${WORLD_H}  maxPlayers=${MAX_PLAYERS}`);
 
 wss.on("connection", (ws, req) => {
   const ip = getIP(req);
+
+  // 満員チェック
+  if (players.size >= MAX_PLAYERS) {
+    ws.close(1013, "Server full");
+    return;
+  }
 
   // IP制限
   const connCount = ipCount.get(ip) || 0;
@@ -136,16 +178,17 @@ wss.on("connection", (ws, req) => {
   }
   ipCount.set(ip, connCount + 1);
 
-  const id  = String(nextId++);
-  const spX = clamp(Math.floor(Math.random() * (WORLD_W - 400)) + 200, 0, WORLD_W);
-  const spY = clamp(Math.floor(Math.random() * (WORLD_H - 400)) + 200, 0, WORLD_H);
+  const id  = `${SHARD_ID}-${nextId++}`;
+  const spX = clamp(Math.floor(Math.random() * (WORLD_W - 2000)) + 1000, 0, WORLD_W);
+  const spY = clamp(Math.floor(Math.random() * (WORLD_H - 2000)) + 1000, 0, WORLD_H);
 
   const p = {
     id, ws, ip,
     x: spX, y: spY,
-    nick: `みんな${id}`, avatar: "👴",
+    nick: `みんな${nextId}`, avatar: "👴",
     title: "", hobbies: [],
-    passcode: null,         // [P]
+    passcode: null,
+    gasUserId: "",
     col: 0, row: 0,
     chatTimes: [],
     lastProfileAt: 0,
@@ -160,29 +203,25 @@ wss.on("connection", (ws, req) => {
     x: spX, y: spY,
     nick: p.nick, avatar: p.avatar,
     worldW: WORLD_W, worldH: WORLD_H,
+    shardId: SHARD_ID,
   });
 
   ws.on("pong", () => { p.isAlive = true; });
 
-  // ── メッセージ受信 ─────────────────────────────────────────────
   ws.on("message", (rawBuf, isBinary) => {
     if (isBinary) return;
     if (rawBuf.length > MAX_MSG_BYTES) { ws.close(1009, "Too large"); return; }
-
     let msg;
     try { msg = JSON.parse(rawBuf.toString("utf8")); } catch { return; }
     if (typeof msg.type !== "string") return;
 
     switch (msg.type) {
 
-      // ── 移動 ──────────────────────────────────────────────────
       case "move": {
         const nx = safeInt(msg.x, 0, WORLD_W);
         const ny = safeInt(msg.y, 0, WORLD_H);
         if (nx === null || ny === null) return;
-        // 速度制限を廃止：座標をそのまま反映（境界clampのみ）
-        p.x = nx;
-        p.y = ny;
+        p.x = nx; p.y = ny;
         const nc = cellOf(p.x, p.y);
         if (nc.col !== p.col || nc.row !== p.row) {
           removeCell(id, p.col, p.row);
@@ -192,7 +231,6 @@ wss.on("connection", (ws, req) => {
         break;
       }
 
-      // ── プロフィール ───────────────────────────────────────────
       case "profile": {
         const now = Date.now();
         if (now - p.lastProfileAt < PROFILE_COOLDOWN) return;
@@ -203,10 +241,11 @@ wss.on("connection", (ws, req) => {
         if (ALLOWED_AVATARS.has(msg.avatar)) p.avatar = msg.avatar;
         if (ALLOWED_TITLES.has(msg.title))   p.title  = msg.title;
         if (Array.isArray(msg.hobbies)) {
-          p.hobbies = msg.hobbies
-            .filter(h => ALLOWED_HOBBIES.has(h)).slice(0, 3);
+          p.hobbies = msg.hobbies.filter(h => ALLOWED_HOBBIES.has(h)).slice(0, 3);
         }
-        // パスコードのプロフィールも更新
+        if (typeof msg.gasUserId === "string") {
+          p.gasUserId = sanitize(msg.gasUserId, 40);
+        }
         if (p.passcode && passcodeStore.has(p.passcode)) {
           passcodeStore.set(p.passcode, {
             nick: p.nick, avatar: p.avatar,
@@ -216,7 +255,6 @@ wss.on("connection", (ws, req) => {
         break;
       }
 
-      // ── チャット ───────────────────────────────────────────────
       case "chat": {
         const now = Date.now();
         p.chatTimes = p.chatTimes.filter(t => now - t < CHAT_RATE_WINDOW);
@@ -237,73 +275,58 @@ wss.on("connection", (ws, req) => {
         break;
       }
 
-      // ── [P] パスコード発行 ─────────────────────────────────────
+      case "call_invite":
+      case "sns_card": {
+        const label = sanitize(String(msg.label || ""), 20);
+        const url   = sanitize(String(msg.url   || ""), 300);
+        if (!url.startsWith("https://") || !label) return;
+        aoiPeers(p.col, p.row).forEach(pid => {
+          const peer = players.get(pid);
+          if (!peer || pid === id) return;
+          if (Math.hypot(peer.x - p.x, peer.y - p.y) > 400) return;
+          safeSend(peer.ws, { type: msg.type, from: id,
+            nick: p.nick, avatar: p.avatar, label, url });
+        });
+        break;
+      }
+
       case "issue_passcode": {
-        if (p.passcode) {
-          // すでに発行済み → 再通知
-          safeSend(ws, { type: "passcode", code: p.passcode });
-          return;
-        }
+        if (p.passcode) { safeSend(ws, { type: "passcode", code: p.passcode }); return; }
         const code = genPasscode();
         p.passcode = code;
         passcodeStore.set(code, {
-          nick: p.nick, avatar: p.avatar,
-          title: p.title, hobbies: p.hobbies,
+          nick: p.nick, avatar: p.avatar, title: p.title, hobbies: p.hobbies,
         });
         safeSend(ws, { type: "passcode", code });
+        const gasUrl = process.env.GAS_URL;
+        if (gasUrl && p.gasUserId) {
+          fetch(gasUrl, {
+            method: "POST",
+            headers: { "Content-Type": "text/plain" },
+            body: JSON.stringify({ action: "save_passcode", user_id: p.gasUserId, passcode: code }),
+          }).catch(() => {});
+        }
         break;
       }
 
-      // ── [P] パスコードで再入室 ─────────────────────────────────
       case "restore_passcode": {
         const code = sanitize(String(msg.code || ""), 8);
         if (!/^\d{8}$/.test(code)) {
-          safeSend(ws, { type: "passcode_result", ok: false, reason: "形式エラー" });
-          return;
+          safeSend(ws, { type: "passcode_result", ok: false, reason: "形式エラー" }); return;
         }
         const saved = passcodeStore.get(code);
         if (!saved) {
-          safeSend(ws, { type: "passcode_result", ok: false, reason: "見つかりません" });
-          return;
+          safeSend(ws, { type: "passcode_result", ok: false, reason: "見つかりません" }); return;
         }
-        // プロフィールを復元
-        p.nick    = saved.nick;
-        p.avatar  = saved.avatar;
-        p.title   = saved.title;
-        p.hobbies = saved.hobbies;
+        p.nick = saved.nick; p.avatar = saved.avatar;
+        p.title = saved.title; p.hobbies = saved.hobbies;
         p.passcode = code;
-        safeSend(ws, {
-          type: "passcode_result", ok: true,
-          nick: p.nick, avatar: p.avatar,
-          title: p.title, hobbies: p.hobbies,
-        });
+        safeSend(ws, { type: "passcode_result", ok: true,
+          nick: p.nick, avatar: p.avatar, title: p.title, hobbies: p.hobbies });
         break;
       }
 
-      // ── [R] WebRTC シグナリング中継 ───────────────────────────
-      // offer / answer / ice をターゲットIDに中継する
-      case "rtc_offer":
-      case "rtc_answer":
-      case "rtc_ice": {
-        const target = players.get(String(msg.to || ""));
-        if (!target) return;
-        // 距離チェック（CALL_RANGE×2以内の相手にのみ中継）
-        if (Math.hypot(target.x - p.x, target.y - p.y) > CALL_RANGE * 2) return;
-        safeSend(target.ws, {
-          type: msg.type,
-          from: id,
-          // SDPとICE候補をそのまま通す（内容は検証しない・暗号化はWSSで担保）
-          sdp:       msg.sdp,
-          candidate: msg.candidate,
-        });
-        break;
-      }
-
-      // ── ping keepalive ────────────────────────────────────────
-      case "ping": {
-        safeSend(ws, { type: "pong" });
-        break;
-      }
+      case "ping": safeSend(ws, { type: "pong" }); break;
     }
   });
 
@@ -334,19 +357,20 @@ setInterval(() => {
     const peerIds  = aoiPeers(p.col, p.row);
     const snapshot = [];
     peerIds.forEach(pid => {
-      if (pid === p.id) return;   // 自分自身は除外
+      if (pid === p.id) return;
       const q = players.get(pid);
       if (!q) return;
-      snapshot.push({
-        id: q.id, x: q.x, y: q.y,
+      snapshot.push({ id: q.id, x: q.x, y: q.y,
         nick: q.nick, avatar: q.avatar,
-        title: q.title, hobbies: q.hobbies,
-      });
+        title: q.title, hobbies: q.hobbies });
     });
     safeSend(p.ws, { type: "snapshot", players: snapshot, total: players.size });
   });
 }, TICK_MS);
 
+// ── ヘルスログ ────────────────────────────────────────────────────
 setInterval(() => {
-  console.log(`[health] online=${players.size} passcodes=${passcodeStore.size}`);
+  const usedCells = cells.size;
+  const totalPeers = [...cells.values()].reduce((s,c)=>s+c.size,0);
+  console.log(`[shard:${SHARD_ID}] online=${players.size}/${MAX_PLAYERS} cells=${usedCells} avgPerCell=${usedCells?( totalPeers/usedCells).toFixed(2):0} passcodes=${passcodeStore.size}`);
 }, 15_000);
