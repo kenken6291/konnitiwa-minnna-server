@@ -252,6 +252,24 @@ wss.on("connection", (ws, req) => {
             title: p.title, hobbies: p.hobbies,
           });
         }
+
+        // GASにユーザー登録・更新（サーバー側から送信）
+        const gasUrl = process.env.GAS_URL;
+        if (gasUrl && p.gasUserId) {
+          fetch(gasUrl, {
+            method: "POST",
+            headers: { "Content-Type": "text/plain" },
+            body: JSON.stringify({
+              action:   "register",
+              user_id:  p.gasUserId,
+              nick:     p.nick,
+              avatar:   p.avatar,
+              title:    p.title,
+              hobbies:  p.hobbies,
+              passcode: p.passcode || "",
+            }),
+          }).catch(() => {});
+        }
         break;
       }
 
