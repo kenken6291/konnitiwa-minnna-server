@@ -298,13 +298,24 @@ wss.on("connection", (ws, req) => {
         const label = sanitize(String(msg.label || ""), 20);
         const url   = sanitize(String(msg.url   || ""), 300);
         if (!url.startsWith("https://") || !label) return;
-        aoiPeers(p.col, p.row).forEach(pid => {
-          const peer = players.get(pid);
-          if (!peer || pid === id) return;
-          if (Math.hypot(peer.x - p.x, peer.y - p.y) > 400) return;
-          safeSend(peer.ws, { type: msg.type, from: id,
-            nick: p.nick, avatar: p.avatar, label, url });
-        });
+
+        // toが指定されている場合は指定IDのみに送信、なければAOI内全員
+        if (Array.isArray(msg.to) && msg.to.length > 0) {
+          msg.to.forEach(tid => {
+            const peer = players.get(String(tid));
+            if (!peer || tid === id) return;
+            safeSend(peer.ws, { type: msg.type, from: id,
+              nick: p.nick, avatar: p.avatar, label, url });
+          });
+        } else {
+          aoiPeers(p.col, p.row).forEach(pid => {
+            const peer = players.get(pid);
+            if (!peer || pid === id) return;
+            if (Math.hypot(peer.x - p.x, peer.y - p.y) > 400) return;
+            safeSend(peer.ws, { type: msg.type, from: id,
+              nick: p.nick, avatar: p.avatar, label, url });
+          });
+        }
         break;
       }
 
