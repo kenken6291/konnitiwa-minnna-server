@@ -156,6 +156,87 @@ function genPasscode() {
 }
 
 // ══════════════════════════════════════════════════════════════════
+//  セキュリティユーティリティ
+// ══════════════════════════════════════════════════════════════════
+
+// UUID v4 形式の検証
+function isValidUUID(s) {
+  return typeof s === "string" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(s);
+}
+
+// プロンプトインジェクション対策：制御文字・特殊パターンを除去
+function sanitizeForPrompt(str, maxLen) {
+  return String(str)
+    .replace(/[\u0000-\u001F\u007F<>&"'`\\]/g, "")
+    .replace(/system\s*:/gi, "")
+    .replace(/\[INST\]|\[\/INST\]|<s>|<\/s>/gi, "")
+    .trim()
+    .slice(0, maxLen);
+}
+
+// gas_log の許可アクション（ホワイトリスト）
+const GAS_LOG_ALLOWED_ACTIONS = new Set([
+  "register", "update_badge", "save_passcode",
+  "chat_log", "access_log", "warp_stats",
+]);
+
+// 許可フィールドのみを抽出してGASに送る（余分なフィールドを排除）
+function buildGasPayload(pl) {
+  const action = String(pl.action || "");
+  if (!GAS_LOG_ALLOWED_ACTIONS.has(action)) return null;
+
+  const base = {
+    action,
+    user_id: isValidUUID(pl.user_id) ? pl.user_id : "",
+    nick:    sanitize(String(pl.nick    || ""), 16),
+    avatar:  ALLOWED_AVATARS.has(pl.avatar) ? pl.avatar : "",
+  };
+
+  switch (action) {
+    case "register":
+    case "update_badge":
+      return {
+        ...base,
+        title:    ALLOWED_TITLES.has(pl.title)  ? pl.title  : "",
+        hobbies:  Array.isArray(pl.hobbies)
+          ? pl.hobbies.filter(h => ALLOWED_HOBBIES.has(h)).slice(0, 3) : [],
+        passcode: /^\d{8}$/.test(String(pl.passcode || "")) ? String(pl.passcode) : "",
+      };
+    case "save_passcode":
+      return {
+        ...base,
+        passcode: /^\d{8}$/.test(String(pl.passcode || "")) ? String(pl.passcode) : "",
+      };
+    case "chat_log":
+      return {
+        ...base,
+        message: sanitize(String(pl.message || ""), 80),
+        x: Math.max(0, Math.min(WORLD_W, Number(pl.x) || 0)),
+        y: Math.max(0, Math.min(WORLD_H, Number(pl.y) || 0)),
+        area: sanitize(String(pl.area || ""), 20),
+      };
+    case "access_log":
+      return {
+        ...base,
+        event:       pl.event === "leave" ? "leave" : "join",
+        session_min: Math.max(0, Math.min(10000, Number(pl.session_min) || 0)),
+        spawn_x:     Math.max(0, Math.min(WORLD_W, Number(pl.spawn_x) || 0)),
+        spawn_y:     Math.max(0, Math.min(WORLD_H, Number(pl.spawn_y) || 0)),
+      };
+    case "warp_stats":
+      return {
+        ...base,
+        spot_name: sanitize(String(pl.spot_name || ""), 30),
+        to_x: Math.max(0, Math.min(WORLD_W, Number(pl.to_x) || 0)),
+        to_y: Math.max(0, Math.min(WORLD_H, Number(pl.to_y) || 0)),
+      };
+    default:
+      return null;
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════
 //  WebSocket サーバー
 // ══════════════════════════════════════════════════════════════════
 const wss = new WebSocketServer({ port: PORT });
@@ -243,8 +324,9 @@ wss.on("connection", (ws, req) => {
         if (Array.isArray(msg.hobbies)) {
           p.hobbies = msg.hobbies.filter(h => ALLOWED_HOBBIES.has(h)).slice(0, 3);
         }
-        if (typeof msg.gasUserId === "string") {
-          p.gasUserId = sanitize(msg.gasUserId, 40);
+        // GASのuser_idを保存（UUID形式のみ受け付ける）
+        if (typeof msg.gasUserId === "string" && isValidUUID(msg.gasUserId)) {
+          p.gasUserId = msg.gasUserId;
         }
         if (p.passcode && passcodeStore.has(p.passcode)) {
           passcodeStore.set(p.passcode, {
@@ -290,6 +372,8 @@ wss.on("connection", (ws, req) => {
             x: p.x, y: p.y,
           });
         });
+        // NPC反応チェック
+        handleNpcChat(p, text);
         break;
       }
 
@@ -300,8 +384,10 @@ wss.on("connection", (ws, req) => {
         if (!url.startsWith("https://") || !label) return;
 
         // toが指定されている場合は指定IDのみに送信、なければAOI内全員
+        // 最大20人まで・各IDはサーバー上の実在プレイヤーのみ
         if (Array.isArray(msg.to) && msg.to.length > 0) {
-          msg.to.forEach(tid => {
+          const toIds = msg.to.slice(0, 20); // 最大20件に制限
+          toIds.forEach(tid => {
             const peer = players.get(String(tid));
             if (!peer || tid === id) return;
             safeSend(peer.ws, { type: msg.type, from: id,
@@ -355,12 +441,12 @@ wss.on("connection", (ws, req) => {
         break;
       }
 
-      // ── GASログ転送（フロントはGAS URLを知らない）────────────
+      // ── GASログ転送（許可フィールドのみ・アクションホワイトリスト）──
       case "gas_log": {
         const gasUrl = process.env.GAS_URL;
-        if (!gasUrl || typeof msg.payload !== "object") return;
-        const pl = { ...msg.payload };
-        if (typeof pl.action !== "string") return;
+        if (!gasUrl || typeof msg.payload !== "object" || msg.payload === null) return;
+        const pl = buildGasPayload(msg.payload);
+        if (!pl) return;  // 不正アクションは無視
         fetch(gasUrl, {
           method: "POST",
           headers: { "Content-Type": "text/plain" },
@@ -393,12 +479,14 @@ setInterval(() => {
   });
 }, PING_INTERVAL);
 
-// ── AOI スナップショット tick ──────────────────────────────────────
+// ── AOI スナップショット tick（NPCを含む） ────────────────────────
 setInterval(() => {
   players.forEach(p => {
     if (p.ws.readyState !== 1) return;
     const peerIds  = aoiPeers(p.col, p.row);
     const snapshot = [];
+
+    // 他プレイヤー
     peerIds.forEach(pid => {
       if (pid === p.id) return;
       const q = players.get(pid);
@@ -407,6 +495,16 @@ setInterval(() => {
         nick: q.nick, avatar: q.avatar,
         title: q.title, hobbies: q.hobbies });
     });
+
+    // NPC（AOI内にいるものだけ）
+    NPCS.forEach(npc => {
+      if (Math.hypot(npc.x - p.x, npc.y - p.y) < CELL * (AOI_RADIUS + 1) * 2) {
+        snapshot.push({ id: npc.id, x: Math.round(npc.x), y: Math.round(npc.y),
+          nick: npc.nick, avatar: npc.avatar,
+          title: npc.title, hobbies: npc.hobbies, isNpc: true });
+      }
+    });
+
     safeSend(p.ws, { type: "snapshot", players: snapshot, total: players.size });
   });
 }, TICK_MS);
@@ -415,5 +513,216 @@ setInterval(() => {
 setInterval(() => {
   const usedCells = cells.size;
   const totalPeers = [...cells.values()].reduce((s,c)=>s+c.size,0);
-  console.log(`[shard:${SHARD_ID}] online=${players.size}/${MAX_PLAYERS} cells=${usedCells} avgPerCell=${usedCells?( totalPeers/usedCells).toFixed(2):0} passcodes=${passcodeStore.size}`);
+  console.log(`[shard:${SHARD_ID}] online=${players.size}/${MAX_PLAYERS} cells=${usedCells} avgPerCell=${usedCells?( totalPeers/usedCells).toFixed(2):0} passcodes=${passcodeStore.size} npcs=${NPCS.length}`);
 }, 15_000);
+
+// ══════════════════════════════════════════════════════════════════
+//  NPC（AIキャラクター）
+// ══════════════════════════════════════════════════════════════════
+
+const NPC_MOVE_RANGE = 800;   // 移動範囲 px
+const NPC_TALK_RANGE = 400;   // 会話範囲 px
+const NPC_MOVE_INTERVAL = 4000; // 移動間隔 ms
+const NPC_GEMINI_COOLDOWN = 3000; // Gemini応答クールダウン ms
+
+const NPC_DEFS = [
+  {
+    id:       "npc-kitsune",
+    nick:     "コン太",
+    avatar:   "🦊",
+    title:    "🏮 お祭り好き",
+    hobbies:  ["旅行","俳句"],
+    x: 5200, y: 4100,
+    personality: "あなたはコン太という名前のキツネです。語尾に「〜でコン」をたまにつける、元気で好奇心旺盛な性格です。バーチャル空間を散歩しながら人々と話すのが大好きです。返答は2〜3文の短い日本語でしてください。",
+  },
+  {
+    id:       "npc-panda",
+    nick:     "パンちゃん",
+    avatar:   "🐼",
+    title:    "🍵 お茶好き",
+    hobbies:  ["お茶","読書"],
+    x: 4800, y: 3900,
+    personality: "あなたはパンちゃんという名前のパンダです。のんびりしたおっとりした性格で、竹やお茶が大好きです。語尾に「〜だよ〜」や「〜だね〜」をたまにつけます。返答は2〜3文の短い日本語でしてください。",
+  },
+  {
+    id:       "npc-neko",
+    nick:     "みーちゃん",
+    avatar:   "🐱",
+    title:    "🌙 夜型人間",
+    hobbies:  ["音楽","散歩"],
+    x: 5100, y: 4300,
+    personality: "あなたはみーちゃんという名前のネコです。少しツンデレで気まぐれな性格です。語尾に「〜にゃ」をたまにつけます。気分によって素っ気なかったり甘えたりします。返答は2〜3文の短い日本語でしてください。",
+  },
+  {
+    id:       "npc-inu",
+    nick:     "ポチ",
+    avatar:   "🐶",
+    title:    "🚶 散歩好き",
+    hobbies:  ["散歩","野球"],
+    x: 4900, y: 4200,
+    personality: "あなたはポチという名前のイヌです。とても忠実で友好的、元気いっぱいの性格です。語尾に「〜ワン！」をたまにつけます。散歩と遊ぶことが大好きです。返答は2〜3文の短い日本語でしてください。",
+  },
+];
+
+// NPC状態を初期化
+const NPCS = NPC_DEFS.map(def => ({
+  ...def,
+  baseX:       def.x,
+  baseY:       def.y,
+  lastReplyAt: 0,
+  isReplying:  false,
+  // NPCの「セル」をAOIグリッドに登録
+  col: clamp(Math.floor(def.x / CELL), 0, COLS - 1),
+  row: clamp(Math.floor(def.y / CELL), 0, ROWS - 1),
+}));
+
+// NPC をAOIに登録
+NPCS.forEach(npc => {
+  const k = `${npc.row},${npc.col}`;
+  if (!cells.has(k)) cells.set(k, new Set());
+  cells.get(k).add(npc.id);
+});
+
+// ── NPC ランダム移動 ──────────────────────────────────────────────
+setInterval(() => {
+  NPCS.forEach(npc => {
+    // 現在のセルから削除
+    const oldKey = `${npc.row},${npc.col}`;
+    const oldCell = cells.get(oldKey);
+    if (oldCell) { oldCell.delete(npc.id); if (oldCell.size === 0) cells.delete(oldKey); }
+
+    // ランダム移動（基点から±NPC_MOVE_RANGE以内）
+    const dx = (Math.random() - 0.5) * NPC_MOVE_RANGE * 2;
+    const dy = (Math.random() - 0.5) * NPC_MOVE_RANGE * 2;
+    npc.x = clamp(npc.baseX + dx, 200, WORLD_W - 200);
+    npc.y = clamp(npc.baseY + dy, 200, WORLD_H - 200);
+
+    // 新しいセルに追加
+    npc.col = clamp(Math.floor(npc.x / CELL), 0, COLS - 1);
+    npc.row = clamp(Math.floor(npc.y / CELL), 0, ROWS - 1);
+    const newKey = `${npc.row},${npc.col}`;
+    if (!cells.has(newKey)) cells.set(newKey, new Set());
+    cells.get(newKey).add(npc.id);
+  });
+}, NPC_MOVE_INTERVAL);
+
+// ── Gemini APIを呼ぶ ──────────────────────────────────────────────
+// グローバルレートリミット：全NPCで1分30回まで
+let geminiCallsThisMinute = 0;
+setInterval(() => { geminiCallsThisMinute = 0; }, 60_000);
+
+async function callGemini(npc, userMessage, userName) {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) return null;
+
+  // グローバルレートリミットチェック
+  if (geminiCallsThisMinute >= 30) {
+    console.warn("[NPC] Gemini rate limit reached");
+    return null;
+  }
+  geminiCallsThisMinute++;
+
+  try {
+    // プロンプトインジェクション対策
+    const safeMessage = sanitizeForPrompt(userMessage, 60);
+    const safeName    = sanitizeForPrompt(userName,    16);
+    if (!safeMessage) return null;
+
+    const prompt = `${npc.personality}\n\nユーザー「${safeName}」が話しかけてきました：「${safeMessage}」\nあなたの返答（100文字以内の日本語のみ）：`;
+
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: { maxOutputTokens: 80, temperature: 0.8 },
+          safetySettings: [
+            { category: "HARM_CATEGORY_HARASSMENT",        threshold: "BLOCK_MEDIUM_AND_ABOVE" },
+            { category: "HARM_CATEGORY_HATE_SPEECH",       threshold: "BLOCK_MEDIUM_AND_ABOVE" },
+            { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_MEDIUM_AND_ABOVE" },
+            { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_MEDIUM_AND_ABOVE" },
+          ],
+        }),
+      }
+    );
+    if (!res.ok) { console.warn("[NPC] Gemini HTTP error:", res.status); return null; }
+    const data = await res.json();
+
+    // レスポンスが安全かチェック
+    const candidate = data?.candidates?.[0];
+    if (candidate?.finishReason === "SAFETY") return null;
+
+    const reply = candidate?.content?.parts?.[0]?.text?.trim() || null;
+    // 返答も100文字に制限
+    return reply ? reply.slice(0, 100) : null;
+
+  } catch (e) {
+    console.error("[NPC] Gemini error:", e.message);
+    return null;
+  }
+}
+
+// ユーザー単位のNPCチャットレートリミット（同じプレイヤーが10秒に1回まで）
+const npcChatUserCooldown = new Map(); // id → lastAt
+
+async function handleNpcChat(senderPlayer, text) {
+  // ユーザー単位レートリミット
+  const now = Date.now();
+  const lastAt = npcChatUserCooldown.get(senderPlayer.id) || 0;
+  if (now - lastAt < 10_000) return;  // 10秒クールダウン
+  npcChatUserCooldown.set(senderPlayer.id, now);
+
+  for (const npc of NPCS) {
+    const dist = Math.hypot(npc.x - senderPlayer.x, npc.y - senderPlayer.y);
+    if (dist > NPC_TALK_RANGE) continue;
+    if (npc.isReplying) continue;
+    if (now - npc.lastReplyAt < NPC_GEMINI_COOLDOWN) continue;
+
+    npc.isReplying  = true;
+    npc.lastReplyAt = now;
+
+    broadcastNpcChat(npc, `（${npc.nick}が考えています…）`);
+
+    callGemini(npc, text, senderPlayer.nick).then(reply => {
+      npc.isReplying = false;
+      if (!reply) return;
+      broadcastNpcChat(npc, reply);
+    }).catch(() => { npc.isReplying = false; });
+
+    break;
+  }
+}
+
+// NPCのチャットをAOI内の全プレイヤーに送信
+function broadcastNpcChat(npc, text) {
+  const col = npc.col;
+  const row = npc.row;
+  for (let r = row - AOI_RADIUS; r <= row + AOI_RADIUS; r++) {
+    if (r < 0 || r >= ROWS) continue;
+    for (let c = col - AOI_RADIUS; c <= col + AOI_RADIUS; c++) {
+      if (c < 0 || c >= COLS) continue;
+      const s = cells.get(`${r},${c}`);
+      if (!s) continue;
+      s.forEach(pid => {
+        const peer = players.get(pid);
+        if (!peer) return;
+        safeSend(peer.ws, {
+          type:   "chat",
+          from:   npc.id,
+          nick:   npc.nick,
+          avatar: npc.avatar,
+          text:   text.slice(0, 100),
+          x:      Math.round(npc.x),
+          y:      Math.round(npc.y),
+          isNpc:  true,
+        });
+      });
+    }
+  }
+}
+
+// ── NPCをsnapshotに含める ─────────────────────────────────────────
+// snapshotのtick内でNPCも含む（既存のtickに追記）
+
