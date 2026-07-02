@@ -525,44 +525,104 @@ const NPC_TALK_RANGE = 400;   // 会話範囲 px
 const NPC_MOVE_INTERVAL = 4000; // 移動間隔 ms
 const NPC_GEMINI_COOLDOWN = 3000; // Gemini応答クールダウン ms
 
-const NPC_DEFS = [
+// ── 8種類の個性パターン ──────────────────────────────────────────
+const NPC_PERSONALITIES = [
   {
-    id:       "npc-kitsune",
-    nick:     "コン太",
-    avatar:   "🦊",
-    title:    "🏮 お祭り好き",
-    hobbies:  ["旅行","俳句"],
-    x: 5200, y: 4100,
-    personality: "あなたはコン太という名前のキツネです。語尾に「〜でコン」をたまにつける、元気で好奇心旺盛な性格です。バーチャル空間を散歩しながら人々と話すのが大好きです。返答は2〜3文の短い日本語でしてください。",
+    avatar: "🦊", titleKey: "🏮 お祭り好き", hobbies: ["旅行","俳句"],
+    suffix: "でコン",
+    personality: "あなたはキツネのキャラクターです。語尾に「〜でコン」をたまにつける、元気で好奇心旺盛な性格です。バーチャル空間を散歩しながら人々と話すのが大好きです。返答は2〜3文の短い日本語でしてください。",
   },
   {
-    id:       "npc-panda",
-    nick:     "パンちゃん",
-    avatar:   "🐼",
-    title:    "🍵 お茶好き",
-    hobbies:  ["お茶","読書"],
-    x: 4800, y: 3900,
-    personality: "あなたはパンちゃんという名前のパンダです。のんびりしたおっとりした性格で、竹やお茶が大好きです。語尾に「〜だよ〜」や「〜だね〜」をたまにつけます。返答は2〜3文の短い日本語でしてください。",
+    avatar: "🐼", titleKey: "🍵 お茶好き", hobbies: ["お茶","読書"],
+    suffix: "だよ〜",
+    personality: "あなたはパンダのキャラクターです。のんびりしたおっとりした性格で、竹やお茶が大好きです。語尾に「〜だよ〜」や「〜だね〜」をたまにつけます。返答は2〜3文の短い日本語でしてください。",
   },
   {
-    id:       "npc-neko",
-    nick:     "みーちゃん",
-    avatar:   "🐱",
-    title:    "🌙 夜型人間",
-    hobbies:  ["音楽","散歩"],
-    x: 5100, y: 4300,
-    personality: "あなたはみーちゃんという名前のネコです。少しツンデレで気まぐれな性格です。語尾に「〜にゃ」をたまにつけます。気分によって素っ気なかったり甘えたりします。返答は2〜3文の短い日本語でしてください。",
+    avatar: "🐱", titleKey: "🌙 夜型人間", hobbies: ["音楽","散歩"],
+    suffix: "にゃ",
+    personality: "あなたはネコのキャラクターです。少しツンデレで気まぐれな性格です。語尾に「〜にゃ」をたまにつけます。気分によって素っ気なかったり甘えたりします。返答は2〜3文の短い日本語でしてください。",
   },
   {
-    id:       "npc-inu",
-    nick:     "ポチ",
-    avatar:   "🐶",
-    title:    "🚶 散歩好き",
-    hobbies:  ["散歩","野球"],
-    x: 4900, y: 4200,
-    personality: "あなたはポチという名前のイヌです。とても忠実で友好的、元気いっぱいの性格です。語尾に「〜ワン！」をたまにつけます。散歩と遊ぶことが大好きです。返答は2〜3文の短い日本語でしてください。",
+    avatar: "🐶", titleKey: "🚶 散歩好き", hobbies: ["散歩","野球"],
+    suffix: "ワン！",
+    personality: "あなたはイヌのキャラクターです。とても忠実で友好的、元気いっぱいの性格です。語尾に「〜ワン！」をたまにつけます。散歩と遊ぶことが大好きです。返答は2〜3文の短い日本語でしてください。",
+  },
+  {
+    avatar: "🐻", titleKey: "🌿 園芸家", hobbies: ["園芸","温泉"],
+    suffix: "クマ",
+    personality: "あなたはクマのキャラクターです。おおらかでのんびりした性格で、はちみつと自然が大好きです。語尾に「〜クマ」をたまにつけます。返答は2〜3文の短い日本語でしてください。",
+  },
+  {
+    avatar: "🐰", titleKey: "☀️ 朝型人間", hobbies: ["料理","手芸"],
+    suffix: "ぴょん",
+    personality: "あなたはウサギのキャラクターです。とても元気で明るい性格です。語尾に「〜ぴょん」をたまにつけます。跳ねるのが大好きで、人と話すのが好きです。返答は2〜3文の短い日本語でしてください。",
+  },
+  {
+    avatar: "🐸", titleKey: "🎵 音楽好き", hobbies: ["音楽","釣り"],
+    suffix: "ケロ",
+    personality: "あなたはカエルのキャラクターです。雨と音楽が大好きな、のんびりした性格です。語尾に「〜ケロ」をたまにつけます。返答は2〜3文の短い日本語でしてください。",
+  },
+  {
+    avatar: "🐹", titleKey: "📚 読書家", hobbies: ["読書","将棋"],
+    suffix: "チュウ",
+    personality: "あなたはハムスターのキャラクターです。ちょこちょこと動き回る、好奇心旺盛な性格です。語尾に「〜チュウ」をたまにつけます。ひまわりの種が大好きです。返答は2〜3文の短い日本語でしてください。",
   },
 ];
+
+// ── 100個のNPC名前リスト（各個性8種 × 12〜13体）────────────────
+const NPC_NAMES = [
+  // 🦊 キツネ系 (13体)
+  "コン太","コン次","コン三","コン吉","コン平","コン助","コン子","コン花","コン雄","コン蔵","コン丸","コン輔","コン之助",
+  // 🐼 パンダ系 (12体)
+  "パンちゃん","パン太","パン吉","パン子","パン蔵","パン丸","パン助","パン平","パン雄","パン花","パン輔","パン之",
+  // 🐱 ネコ系 (13体)
+  "みーちゃん","タマ","クロ","シロ","トラ","チャチャ","モモ","ソラ","ミント","ユキ","ハナ","サクラ","コトン",
+  // 🐶 イヌ系 (12体)
+  "ポチ","ハチ","クロ助","シロ丸","タロ","ジロ","サブ","ゴン","テツ","リキ","ダイ","フク",
+  // 🐻 クマ系 (12体)
+  "クマ太","クマ吉","グリ","モグ","ベア太","クマ子","クマ蔵","モフ","ハチ蔵","クマ平","ぐま","グーミン",
+  // 🐰 ウサギ系 (12体)
+  "ぴょん太","ミミ","ラビ","うさ吉","モカ","ラム","ピコ","ミルク","コトン","ぴょこ","チョコ","バニ",
+  // 🐸 カエル系 (13体)
+  "ケロ太","ケロ吉","ゲコ","ピョン","カエル太","ケロ子","ゲコ吉","ぴょこ太","ケロ蔵","ケロ平","ゲコ丸","ケロミ","ぴょん蔵",
+  // 🐹 ハムスター系 (13体)
+  "ハム太","ハム吉","チュウ太","まるお","ちびた","ハムコ","チュウ吉","まめ蔵","ハム蔵","チュウ平","まるちゃん","ぷくお","チュウ之",
+];
+
+// ── 100体のNPC定義を自動生成 ─────────────────────────────────────
+// ワールドを10×10のグリッドに分割して均等配置
+const NPC_DEFS = (() => {
+  const defs = [];
+  const gridW = Math.floor(WORLD_W / 10);
+  const gridH = Math.floor(WORLD_H / 10);
+
+  NPC_NAMES.slice(0, 100).forEach((name, i) => {
+    const ptn  = NPC_PERSONALITIES[i % NPC_PERSONALITIES.length];
+    const gridX = (i % 10);
+    const gridY = Math.floor(i / 10);
+
+    // グリッド内でランダムオフセット（端から距離を取る）
+    const x = clamp(
+      Math.floor(gridW * gridX + gridW * 0.2 + Math.random() * gridW * 0.6),
+      500, WORLD_W - 500
+    );
+    const y = clamp(
+      Math.floor(gridH * gridY + gridH * 0.2 + Math.random() * gridH * 0.6),
+      500, WORLD_H - 500
+    );
+
+    defs.push({
+      id:          `npc-${i}`,
+      nick:        name,
+      avatar:      ptn.avatar,
+      title:       ptn.titleKey,
+      hobbies:     ptn.hobbies,
+      x, y,
+      personality: ptn.personality.replace("あなたは", `あなたは${name}という名前の`),
+    });
+  });
+  return defs;
+})();
 
 // NPC状態を初期化
 const NPCS = NPC_DEFS.map(def => ({
@@ -607,7 +667,7 @@ setInterval(() => {
 }, NPC_MOVE_INTERVAL);
 
 // ── Gemini APIを呼ぶ ──────────────────────────────────────────────
-// グローバルレートリミット：全NPCで1分30回まで
+// グローバルレートリミット：全NPCで1分50回まで（100体対応）
 let geminiCallsThisMinute = 0;
 setInterval(() => { geminiCallsThisMinute = 0; }, 60_000);
 
@@ -616,7 +676,7 @@ async function callGemini(npc, userMessage, userName) {
   if (!apiKey) return null;
 
   // グローバルレートリミットチェック
-  if (geminiCallsThisMinute >= 30) {
+  if (geminiCallsThisMinute >= 50) {
     console.warn("[NPC] Gemini rate limit reached");
     return null;
   }
@@ -664,6 +724,9 @@ async function callGemini(npc, userMessage, userName) {
   }
 }
 
+// Geminiで返答するNPCは最初の4体のみ（コン太・パンちゃん・みーちゃん・ポチ）
+const TALKING_NPC_IDS = new Set(["npc-0", "npc-1", "npc-2", "npc-3"]);
+
 // ユーザー単位のNPCチャットレートリミット（同じプレイヤーが10秒に1回まで）
 const npcChatUserCooldown = new Map(); // id → lastAt
 
@@ -675,6 +738,9 @@ async function handleNpcChat(senderPlayer, text) {
   npcChatUserCooldown.set(senderPlayer.id, now);
 
   for (const npc of NPCS) {
+    // 返答できるのは指定4体のみ
+    if (!TALKING_NPC_IDS.has(npc.id)) continue;
+
     const dist = Math.hypot(npc.x - senderPlayer.x, npc.y - senderPlayer.y);
     if (dist > NPC_TALK_RANGE) continue;
     if (npc.isReplying) continue;
